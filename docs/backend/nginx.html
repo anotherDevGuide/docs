@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Nginx &mdash; Backend Docs</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../../css/style.css">
+  <style>
+    .concept-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px;
+      margin: 16px 0;
+    }
+    .concept-card h4 {
+      color: var(--accent);
+      font-size: 1.1rem;
+      margin-bottom: 8px;
+    }
+    .concept-card p {
+      margin: 0;
+    }
+    .key-point {
+      display: flex;
+      align-items: flex-start;
+      gap: 12px;
+      padding: 16px;
+      background: var(--accent-dim);
+      border-radius: var(--radius);
+      margin: 16px 0;
+    }
+    .key-point-icon { font-size: 1.2rem; line-height: 1; }
+    .key-point p { margin: 0; color: var(--text); }
+  </style>
+</head>
+<body>
+
+  <div class="container">
+    <header class="doc-header">
+      <a href="index.html">&larr; Back to Backend docs</a>
+      <h1>Nginx</h1>
+      <p class="subtitle">Study guide: source code implementation, event loop, modules, config, and common patterns</p>
+    </header>
+
+    <article class="doc-content">
+
+      <h2>What is Nginx?</h2>
+      <p>Nginx is a high-performance web server, reverse proxy, load balancer, and HTTP cache. It uses an event-driven, non-blocking architecture and is widely used to serve static content, proxy requests to application servers, and terminate SSL/TLS.</p>
+
+      <div class="key-point">
+        <span class="key-point-icon">💡</span>
+        <p><strong>Why nginx?</strong> Handles many concurrent connections with low memory use. One process can serve thousands of connections via an event loop (epoll on Linux, kqueue on BSD/macOS) instead of one thread/process per connection.</p>
+      </div>
+
+      <h2>Architecture</h2>
+      <p>Nginx runs a <strong>master process</strong> and one or more <strong>worker processes</strong>. The master manages workers; workers accept and handle connections. Configuration is loaded at startup (and on <code>nginx -s reload</code>).</p>
+
+      <ul>
+        <li><strong>Master:</strong> Reads config, opens sockets, manages workers (restart on crash, graceful reload).</li>
+        <li><strong>Workers:</strong> Event-driven loop: accept events (new connection, data ready), run handlers (e.g. serve file, proxy to upstream). No blocking I/O per connection.</li>
+      </ul>
+
+      <h2>Source Code Layout</h2>
+      <p>Nginx is written in C. The codebase lives under <code>src/</code> in the <a href="https://github.com/nginx/nginx" target="_blank" rel="noopener">nginx/nginx repo</a>. Key directories:</p>
+      <table>
+        <thead>
+          <tr>
+            <th>Directory</th>
+            <th>Purpose</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>src/core/</code></td>
+            <td>Core: main entry (<code>nginx.c</code>), config parsing, cycle, string, array, hash, pool, log</td>
+          </tr>
+          <tr>
+            <td><code>src/event/</code></td>
+            <td>Event core: <code>ngx_event.c</code> (event loop), timers, posted events</td>
+          </tr>
+          <tr>
+            <td><code>src/event/modules/</code></td>
+            <td>Platform-specific event modules: <code>ngx_epoll_module.c</code> (Linux), <code>ngx_kqueue_module.c</code> (BSD/macOS), <code>select</code>, <code>poll</code>, <code>/dev/poll</code>, IOCP (Windows)</td>
+          </tr>
+          <tr>
+            <td><code>src/http/</code></td>
+            <td>HTTP core: request parsing, phases, variables, upstream</td>
+          </tr>
+          <tr>
+            <td><code>src/http/modules/</code></td>
+            <td>HTTP modules: proxy, fastcgi, ssl, gzip, rewrite, etc.</td>
+          </tr>
+          <tr>
+            <td><code>src/os/unix/</code></td>
+            <td>POSIX-specific: process, signal, socket, file I/O</td>
+          </tr>
+        </tbody>
+      </table>
+      <p>Every nginx C file starts with <code>#include &lt;ngx_config.h&gt;</code> and <code>#include &lt;ngx_core.h&gt;</code>. HTTP code also includes <code>ngx_http.h</code>.</p>
+
+      <h2>Entry Point &amp; Main Flow</h2>
+      <p>Main entry is <code>main()</code> in <code>src/core/nginx.c</code>:</p>
+      <pre><code>/* Simplified flow */
+main() {
+    ngx_time_init();
+    log = ngx_log_init(...);
+    init_cycle.pool = ngx_create_pool(1024, log);
+    ngx_process_options(&amp;init_cycle);
+    ngx_os_init(log);
+
+    cycle = ngx_init_cycle(&amp;init_cycle);  /* Parse config, load modules */
+
+    if (ngx_process == NGX_PROCESS_SINGLE)
+        ngx_single_process_cycle(cycle);
+    else
+        ngx_master_process_cycle(cycle);   /* Master + workers */
+}</code></pre>
+      <p><code>ngx_init_cycle()</code> parses the config file, creates module configs, and opens listening sockets. <code>ngx_master_process_cycle()</code> spawns worker processes; each worker runs <code>ngx_worker_process_cycle()</code> which calls <code>ngx_process_events_and_timers()</code> in a loop.</p>
+
+      <h2>Event Loop (Worker Implementation)</h2>
+      <p>The worker event loop is in <code>src/event/ngx_event.c</code>, function <code>ngx_process_events_and_timers()</code>:</p>
+      <pre><code>void ngx_process_events_and_timers(ngx_cycle_t *cycle)
+{
+    timer = ngx_event_find_timer();           /* Next timer expiry */
+    flags = NGX_UPDATE_TIME;
+
+    if (ngx_use_accept_mutex) {
+        if (ngx_trylock_accept_mutex(cycle) == NGX_OK) {
+            flags |= NGX_POST_EVENTS;         /* Post accept to queue */
+        }
+    }
+
+    (void) ngx_process_events(cycle, timer, flags);  /* epoll_wait / kevent */
+
+    ngx_event_process_posted(cycle, &amp;ngx_posted_accept_events);
+    if (ngx_accept_mutex_held)
+        ngx_shmtx_unlock(&amp;ngx_accept_mutex);
+
+    ngx_event_expire_timers();
+    ngx_event_process_posted(cycle, &amp;ngx_posted_events);
+}</code></pre>
+      <p><code>ngx_process_events()</code> is a function pointer from the event module (epoll, kqueue, etc.). On Linux it calls <code>epoll_wait()</code>; on BSD/macOS it calls <code>kevent()</code>. When a socket becomes ready, the corresponding <code>ngx_event_t</code> handler is invoked (e.g. <code>ngx_event_accept</code> for new connections, or HTTP read/write handlers).</p>
+      <p><strong>Accept mutex:</strong> With multiple workers, only one holds the accept mutex at a time so new connections are distributed across workers instead of all going to one.</p>
+
+      <h2>Module System</h2>
+      <p>Nginx is modular. Each module declares directives and callbacks via <code>ngx_module_t</code>:</p>
+      <pre><code>ngx_module_t  ngx_core_module = {
+    NGX_MODULE_V1,
+    &amp;ngx_core_module_ctx,      /* context (create_conf, init_conf) */
+    ngx_core_commands,         /* directive definitions */
+    NGX_CORE_MODULE,
+    NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+};</code></pre>
+      <p>Directives map to handlers via <code>ngx_command_t</code>. For example, <code>worker_processes</code> in <code>nginx.c</code> calls <code>ngx_set_worker_processes</code>. The config parser walks the config tree and invokes the correct handler for each directive.</p>
+      <p><strong>Return codes:</strong> Handlers return <code>NGX_OK</code>, <code>NGX_ERROR</code>, <code>NGX_AGAIN</code> (call again when ready), <code>NGX_DECLINED</code> (handled by another module), etc.</p>
+
+      <h2>Key Data Structures</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Type</th>
+            <th>Purpose</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>ngx_cycle_t</code></td>
+            <td>Runtime cycle: config, listening sockets, connections, pools</td>
+          </tr>
+          <tr>
+            <td><code>ngx_connection_t</code></td>
+            <td>Per-connection state: fd, read/write events, data pointer</td>
+          </tr>
+          <tr>
+            <td><code>ngx_event_t</code></td>
+            <td>Event: handler, ready/active flags, timer link</td>
+          </tr>
+          <tr>
+            <td><code>ngx_str_t</code></td>
+            <td><code>{ size_t len; u_char *data; }</code> &mdash; length + pointer, often not null-terminated</td>
+          </tr>
+          <tr>
+            <td><code>ngx_pool_t</code></td>
+            <td>Memory pool: allocs freed when pool is destroyed (request lifecycle)</td>
+          </tr>
+        </tbody>
+      </table>
+      <p>Workers pre-allocate <code>ngx_connection_t</code> and <code>ngx_event_t</code> arrays at startup. Connections are taken from a free list via <code>ngx_get_connection()</code> and returned when done.</p>
+      <p>For full development details (strings, containers, memory, HTTP phases), see the official <a href="https://nginx.org/en/docs/dev/development_guide.html" target="_blank" rel="noopener">Development guide</a>.</p>
+
+      <h2>Config Structure</h2>
+      <p>Main config is usually <code>/etc/nginx/nginx.conf</code>. It’s built from <strong>directives</strong> and <strong>contexts</strong> (blocks). Only certain directives are allowed in each context.</p>
+
+      <h3>Main contexts</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>Context</th>
+            <th>Purpose</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>events { }</code></td>
+            <td>Connection processing (e.g. <code>worker_connections</code>)</td>
+          </tr>
+          <tr>
+            <td><code>http { }</code></td>
+            <td>HTTP server settings, upstreams, and <code>server</code> blocks</td>
+          </tr>
+          <tr>
+            <td><code>server { }</code></td>
+            <td>Virtual host: one per hostname/port (inside <code>http</code>)</td>
+          </tr>
+          <tr>
+            <td><code>location [modifier] uri { }</code></td>
+            <td>How to handle a specific URI path (inside <code>server</code>)</td>
+          </tr>
+          <tr>
+            <td><code>upstream name { }</code></td>
+            <td>Group of backend servers for load balancing (inside <code>http</code>)</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Location matching</h3>
+      <p><code>location</code> blocks define which config applies to a request URI. Modifiers change how the URI is matched:</p>
+      <table>
+        <thead>
+          <tr>
+            <th>Modifier</th>
+            <th>Meaning</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>= /exact</code></td>
+            <td>Exact match only</td>
+          </tr>
+          <tr>
+            <td><code>^~ /prefix</code></td>
+            <td>Prefix match; stop searching if this matches (no regex)</td>
+          </tr>
+          <tr>
+            <td><code>~ regex</code></td>
+            <td>Case-sensitive regex</td>
+          </tr>
+          <tr>
+            <td><code>~* regex</code></td>
+            <td>Case-insensitive regex</td>
+          </tr>
+          <tr>
+            <td><code>/prefix</code> (none)</td>
+            <td>Prefix match; regex locations still checked</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h2>Reverse Proxy</h2>
+      <p>Nginx receives requests and forwards them to a backend (e.g. Node, Python, Go app). The client talks only to nginx; the app runs on localhost or another server.</p>
+
+      <pre><code>server {
+    listen 80;
+    server_name api.example.com;
+
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}</code></pre>
+
+      <ul>
+        <li><code>proxy_pass</code>: Backend URL. If it includes a path, the request URI is replaced by that path; otherwise the full URI is passed.</li>
+        <li><code>proxy_set_header</code>: Headers sent to the backend. <code>Host</code>, <code>X-Real-IP</code>, <code>X-Forwarded-*</code> are typical so the app knows original host and client IP.</li>
+      </ul>
+
+      <h2>Load Balancing (upstream)</h2>
+      <p>Use an <code>upstream</code> block to define multiple backends. Nginx distributes requests among them.</p>
+
+      <pre><code>upstream app_backend {
+    server 127.0.0.1:3000;
+    server 127.0.0.1:3001;
+    server 127.0.0.1:3002;
+}
+
+server {
+    listen 80;
+    location / {
+        proxy_pass http://app_backend;
+        proxy_set_header Host $host;
+    }
+}</code></pre>
+
+      <p>Default method is <strong>round-robin</strong>. Other options: <code>least_conn</code>, <code>ip_hash</code> (sticky by client IP), or <code>hash $request_uri</code>. You can add <code>weight</code> and <code>backup</code> to <code>server</code> lines.</p>
+
+      <h2>Serving Static Files</h2>
+      <p>Use <code>root</code> or <code>alias</code> to serve files from disk. <code>root</code> appends the request URI to the path; <code>alias</code> replaces the matched location path with the alias path.</p>
+
+      <pre><code># root: files under /var/www/site (e.g. /foo → /var/www/site/foo)
+location / {
+    root /var/www/site;
+    try_files $uri $uri/ /index.html;
+}
+
+# alias: /static/... → /var/www/assets/...
+location /static/ {
+    alias /var/www/assets/;
+}</code></pre>
+
+      <p><code>try_files</code> tries each path in order; the last argument can be a URI (e.g. fallback to <code>/index.html</code> for SPAs).</p>
+
+      <h2>SSL / HTTPS</h2>
+      <p>Terminate TLS in nginx: listen on 443 with <code>ssl</code>, point to certificate and key.</p>
+
+      <pre><code>server {
+    listen 443 ssl;
+    server_name example.com;
+
+    ssl_certificate     /etc/nginx/ssl/example.com.crt;
+    ssl_certificate_key /etc/nginx/ssl/example.com.key;
+
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers on;
+
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}</code></pre>
+
+      <p>Redirect HTTP to HTTPS with a separate <code>server</code> block:</p>
+      <pre><code>server {
+    listen 80;
+    server_name example.com;
+    return 301 https://$server_name$request_uri;
+}</code></pre>
+
+      <h2>Common Directives Quick Reference</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Directive</th>
+            <th>Context</th>
+            <th>Purpose</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>listen</code></td>
+            <td>server</td>
+            <td>IP:port (e.g. <code>80</code>, <code>443 ssl</code>)</td>
+          </tr>
+          <tr>
+            <td><code>server_name</code></td>
+            <td>server</td>
+            <td>Hostnames for this vhost (or default)</td>
+          </tr>
+          <tr>
+            <td><code>root</code></td>
+            <td>http, server, location</td>
+            <td>Base path for static files (URI appended)</td>
+          </tr>
+          <tr>
+            <td><code>alias</code></td>
+            <td>location</td>
+            <td>Path that replaces matched location</td>
+          </tr>
+          <tr>
+            <td><code>proxy_pass</code></td>
+            <td>location</td>
+            <td>Backend URL for reverse proxy</td>
+          </tr>
+          <tr>
+            <td><code>try_files</code></td>
+            <td>server, location</td>
+            <td>Check files/paths in order; last can be fallback URI</td>
+          </tr>
+          <tr>
+            <td><code>return</code></td>
+            <td>server, location</td>
+            <td>Immediate response (e.g. <code>301</code>, <code>404</code>)</td>
+          </tr>
+          <tr>
+            <td><code>include</code></td>
+            <td>any</td>
+            <td>Include another config file</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h2>Useful Commands</h2>
+      <pre><code>nginx -t              # Test config
+nginx -s reload        # Reload config (graceful)
+nginx -s stop          # Stop
+nginx -s quit          # Graceful shutdown</code></pre>
+
+      <blockquote>After editing <code>nginx.conf</code> or files in <code>sites-enabled/</code>, run <code>nginx -t</code> then <code>nginx -s reload</code> to apply changes without dropping connections.</blockquote>
+
+    </article>
+
+    <footer class="doc-footer">
+      <a href="index.html">&larr; Back to Backend docs</a>
+    </footer>
+  </div>
+
+</body>
+</html>

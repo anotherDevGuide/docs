@@ -58,6 +58,26 @@ body {
   font-size: 1.05rem;
 }
 
+.site-header .back-link-wrap {
+  text-align: left;
+  margin-bottom: 16px;
+}
+
+.site-header .back-link-wrap a {
+  color: var(--accent);
+  text-decoration: none;
+  font-size: 0.9rem;
+}
+
+.site-header .back-link-wrap a:link,
+.site-header .back-link-wrap a:visited {
+  color: var(--accent);
+}
+
+.site-header .back-link-wrap a:hover {
+  opacity: 0.9;
+}
+
 /* ---- card grid ---- */
 
 .card-grid {
@@ -161,14 +181,21 @@ body {
   margin-bottom: 32px;
 }
 
-.doc-header a {
+.doc-header > a {
+  display: inline-block;
   color: var(--accent);
   text-decoration: none;
   font-size: 0.9rem;
+  margin-bottom: 16px;
 }
 
-.doc-header a:hover {
-  text-decoration: underline;
+.doc-header > a:link,
+.doc-header > a:visited {
+  color: var(--accent);
+}
+
+.doc-header > a:hover {
+  opacity: 0.9;
 }
 
 .doc-header h1 {
@@ -282,8 +309,13 @@ body {
   font-size: 0.9rem;
 }
 
+.doc-footer a:link,
+.doc-footer a:visited {
+  color: var(--accent);
+}
+
 .doc-footer a:hover {
-  text-decoration: underline;
+  opacity: 0.9;
 }
 
 /* ---- responsive ---- */
